@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
+import 'package:weather_watcher/models/ble_characteristic.dart';
+import 'package:weather_watcher/sensors/sensorpush.dart';
 import 'package:weather_watcher/utils/ble_utils.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -37,6 +39,7 @@ class _BleTestScreenState extends State<BleTestScreen> {
   bool _scanning = false;
   bool _scanningSupported = false;
   DateTime? _lastScan;
+  String? _sensorOutput;
 
   Future<void> _scan() async {
     if (_scanning) return;
@@ -91,6 +94,21 @@ class _BleTestScreenState extends State<BleTestScreen> {
     });
   }
 
+  Future<void> _testSensorPushRead() async {
+    const deviceId = '2037602C-1C15-BEE5-B4E7-8D6025F45DF1';
+    final sensorPush = SensorPush.defaultConfig();
+
+    setState(() => _sensorOutput = '🔄 Reading...');
+
+    try {
+      final result = await sensorPush.getTempAndHumidity(deviceId: deviceId);
+      setState(() => _sensorOutput = '🌡️ Temp: ${result['temperature_C']} °C\n'
+          '💧 Humidity: ${result['humidity_percent']} % \n🔋 Voltage: ${result['voltage_mV']} mV\n');
+    } catch (e) {
+      setState(() => _sensorOutput = '❌ Error: $e');
+    }
+  }
+
   @override
   void dispose() {
     BleUtils.dispose();
@@ -142,8 +160,17 @@ class _BleTestScreenState extends State<BleTestScreen> {
                 )
                     : const Text('Supported Sensors'),
               ),
+              ElevatedButton(
+                onPressed: _testSensorPushRead,
+                child: const Text('Test SensorPush'),
+              ),
             ],
           ),
+          if (_sensorOutput != null)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(_sensorOutput!, style: const TextStyle(fontSize: 16)),
+            ),
           const Divider(height: 32),
           Expanded(
             child: ListView.builder(
@@ -154,11 +181,168 @@ class _BleTestScreenState extends State<BleTestScreen> {
                   title: Text(
                     'Name: ${d.name.isNotEmpty ? d.name : '(Unnamed)'}\nID: ${d.id}\nRSSI: ${d.rssi}',
                   ),
+                  onTap: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => SensorDetailPage(device: d),
+                      ),
+                    );
+                  },
                 );
               },
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+
+class SensorDetailPage extends StatefulWidget {
+  final DiscoveredDevice device;
+
+  const SensorDetailPage({super.key, required this.device});
+
+  @override
+  State<SensorDetailPage> createState() => _SensorDetailPageState();
+}
+
+class _SensorDetailPageState extends State<SensorDetailPage> {
+  Map<String, List<BleCharacteristic>>? gattInfo;
+  bool loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadGatt();
+  }
+
+  Future<void> _loadGatt() async {
+    try {
+      final result = await BleUtils.connectAndCheckGatt(widget.device.id);
+      setState(() {
+        gattInfo = result;
+        loading = false;
+      });
+    } catch (e) {
+      setState(() {
+        gattInfo = {
+          'Error': [
+            BleCharacteristic(
+              uuid: 'error',
+              name: e.toString(),
+              capabilities: [],
+            )
+          ]
+        };
+        loading = false;
+      });
+    }
+  }
+
+  void _navigateToCharacteristic(String deviceId, String serviceId, BleCharacteristic characteristic) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CharacteristicValuePage(
+          deviceId: deviceId,
+          serviceId: serviceId,
+          characteristicId: characteristic.uuid,
+          capabilities: characteristic.capabilities,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.device.name.isNotEmpty ? widget.device.name : widget.device.id)),
+      body: loading
+          ? const Center(child: CircularProgressIndicator())
+          : gattInfo == null || gattInfo!.isEmpty
+          ? const Center(child: Text('Not GATT-enabled or no services found.'))
+          : ListView(
+        children: gattInfo!.entries.map((entry) {
+          return ExpansionTile(
+            title: Text(entry.key),
+            children: entry.value.map((char) => ListTile(
+              title: Text('${char.name} (${char.capabilities.join(", ")})'),
+              onTap: () => _navigateToCharacteristic(
+                widget.device.id,
+                entry.key,
+                char,
+              ),
+            )).toList(),
+          );
+        }).toList(),
+      ),
+    );
+  }
+}
+
+class CharacteristicValuePage extends StatefulWidget {
+  final String deviceId;
+  final String serviceId;
+  final String characteristicId;
+  final List<String> capabilities;
+
+  const CharacteristicValuePage({
+    super.key,
+    required this.deviceId,
+    required this.serviceId,
+    required this.characteristicId,
+    required this.capabilities,
+  });
+
+  @override
+  State<CharacteristicValuePage> createState() => _CharacteristicValuePageState();
+}
+
+class _CharacteristicValuePageState extends State<CharacteristicValuePage> {
+  String? value;
+  bool loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _readValue();
+  }
+
+  Future<void> _readValue() async {
+    try {
+      final result = await BleUtils.readCharacteristic(
+        deviceId: widget.deviceId,
+        serviceUuid: Uuid.parse(widget.serviceId),
+        characteristicUuid: Uuid.parse(widget.characteristicId),
+        capabilities: widget.capabilities,
+      );
+      setState(() {
+        value = result.toString();
+        loading = false;
+      });
+    } catch (e) {
+      print('Error reading characteristic: $e');
+      setState(() {
+        value = '❌ Error: $e';
+        loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.characteristicId)),
+      body: Center(
+        child: loading
+            ? const CircularProgressIndicator()
+            : Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Text(value ?? 'No value'),
+        ),
       ),
     );
   }
